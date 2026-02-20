@@ -1,355 +1,282 @@
 """
-DOCX Section Segregation Script
-================================
-Splits a monolithic math textbook DOCX into individual files
-organized by Unit / Chapter / Section (A-G, skipping E).
+Universal DOCX Section Segregation Script
+==========================================
+Processes all .docx files in input/ subdirectories and splits them by
+section markers (A-G, skipping E). Each section is output as a separate
+file, cloned from the source to preserve ALL formatting (fonts, bold,
+italic, styles, numbering, images).
 
-Output: output/Unit {roman} Ch {n} Sec {letter}.docx
-
-Preserves ALL formatting by cloning the source document's internal
-parts (styles, numbering, fonts, themes) and then replacing the body
-with only the relevant paragraphs.
+Output: output/{SubjectFolder}/Unit {N} Sec {letter}.docx
 """
 
 import os
 import re
 import copy
 import io
+import glob
 from docx import Document
 from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
-from lxml import etree
 
-INPUT_FILE = r'input\Core Math XI HS 3.0 NEW.docx'
+INPUT_DIR = 'input'
 OUTPUT_DIR = 'output'
-SECTIONS_TO_SKIP = {'E'}  # Skip Section E (Question Bank)
+SECTIONS_TO_SKIP = {'E'}
 
-ROMAN_MAP = {1: 'I', 2: 'II', 3: 'III', 4: 'IV', 5: 'V', 6: 'VI'}
+# Regex to detect section markers like "A. Summary", "B. In-Depth..."
+SECTION_RE = re.compile(r'^([A-G])\.\s')
+
+# Known section title fragments — used to validate that a match is a real
+# section marker and not a random paragraph starting with "C. Think of..."
+SECTION_TITLE_PATTERNS = [
+    'summary', 'concept map', 'unit number', 'unit information',
+    'in-depth', 'explanation', 'analysis',
+    'flashcard', 'memory',
+    'key terms', 'keyword',
+    'question bank',
+    'exam strategy', 'strategy note',
+    'fun fact',
+    # Geography uses inline unit/chapter info like "A. Unit I, Chapter 1:"
+    'unit i', 'unit ii', 'unit iii', 'unit iv', 'unit v', 'unit vi',
+]
+
+# Body element tags
+W_P = qn('w:p')      # paragraph
+W_TBL = qn('w:tbl')  # table
+W_SECT_PR = qn('w:sectPr')  # section properties (page layout)
 
 
-def parse_structure(doc):
+def get_paragraph_text(element):
     """
-    Parse the document to identify Unit, Chapter, and Section boundaries.
-    Returns a list of dicts with unit/chapter/section info and paragraph ranges.
+    Extract plain text from a w:p element, inserting \\n for w:br elements.
+    This allows detection of inline section markers after line breaks.
     """
-    paragraphs = doc.paragraphs
-    total = len(paragraphs)
+    ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    parts = []
+    for run in element.findall(f'{{{ns}}}r'):
+        for child in run:
+            if child.tag == f'{{{ns}}}t' and child.text:
+                parts.append(child.text)
+            elif child.tag == f'{{{ns}}}br':
+                parts.append('\n')
+    return ''.join(parts).strip()
 
-    markers = []
 
-    for i, p in enumerate(paragraphs):
-        txt = p.text.strip()
-        if not txt:
-            continue
+def is_real_section_marker(full_text, letter):
+    """
+    Verify that a detected section marker is a real structural section,
+    not a content paragraph that happens to start with a letter and period.
+    """
+    # Get the text after the section letter (e.g. "A. Summary & Concept Map" -> "Summary & Concept Map")
+    after_letter = full_text.split('.', 1)[1].strip().lower() if '.' in full_text else ''
 
-        # Unit marker
-        m = re.match(r'^(Unit\s+[IVXLC]+:\s+.+)$', txt)
-        if m:
-            markers.append((i, 'unit', m.group(1)))
-            continue
+    # Check if any known section title fragment appears
+    for pattern in SECTION_TITLE_PATTERNS:
+        if pattern in after_letter:
+            return True
 
-        # Chapter marker (may contain Section A via newline)
-        m = re.match(r'^(Chapter\s*[\d:].+?)(?:\n(.+))?$', txt, re.DOTALL)
-        if m:
-            markers.append((i, 'chapter', m.group(1).strip()))
-            if m.group(2):
-                sec_text = m.group(2).strip()
-                sec_m = re.match(r'^([A-G])\.\s', sec_text)
-                if sec_m:
-                    markers.append((i, 'section', sec_m.group(1), True))
-            continue
+    return False
 
-        # Section marker
-        m = re.match(r'^([A-G])\.\s', txt)
-        if m:
-            markers.append((i, 'section', m.group(1), False))
-            continue
 
-    # Build hierarchical structure
-    entries = []
-    current_unit = None
-    current_unit_num = 0
-    current_chapter = None
-    current_chapter_num = 0
-    unit_chapter_counter = {}
+def find_section_boundaries(body):
+    """
+    Scan all body children to find section boundaries.
+    Returns a list of (element_index, section_letter) for each section marker.
 
-    roman_to_int = {'I': 1, 'II': 2, 'III': 3, 'IV': 4, 'V': 5, 'VI': 6}
+    Also detects inline section markers embedded via newline characters
+    (e.g. "Chapter 1: Sets\\nA. Summary & Concept Map").
+    """
+    boundaries = []
+    children = list(body)
 
-    for idx, marker in enumerate(markers):
-        para_idx = marker[0]
-        mtype = marker[1]
-
-        if mtype == 'unit':
-            unit_text = marker[2]
-            um = re.match(r'Unit\s+([IVXLC]+):', unit_text)
-            if um:
-                current_unit = unit_text
-                roman = um.group(1)
-                current_unit_num = roman_to_int.get(roman, 0)
-                if current_unit_num not in unit_chapter_counter:
-                    unit_chapter_counter[current_unit_num] = 0
-
-        elif mtype == 'chapter':
-            chapter_text = marker[2]
-            if current_unit_num > 0:
-                unit_chapter_counter[current_unit_num] += 1
-                current_chapter_num = unit_chapter_counter[current_unit_num]
-            current_chapter = chapter_text
-
-        elif mtype == 'section':
-            section_letter = marker[2]
-            is_inline = marker[3] if len(marker) > 3 else False
-
-            if current_unit is None or current_chapter is None:
+    for idx, child in enumerate(children):
+        if child.tag == W_P:
+            txt = get_paragraph_text(child)
+            if not txt:
                 continue
 
-            # End = next marker's paragraph - 1, or end of doc
-            end_para = total - 1
-            for next_idx in range(idx + 1, len(markers)):
-                end_para = markers[next_idx][0] - 1
-                break
+            # Check if the paragraph itself starts with a section marker
+            m = SECTION_RE.match(txt)
+            if m:
+                letter = m.group(1)
+                if is_real_section_marker(txt, letter):
+                    boundaries.append((idx, letter))
+                continue
 
-            entries.append({
-                'unit': current_unit,
-                'unit_num': current_unit_num,
-                'chapter': current_chapter,
-                'chapter_num': current_chapter_num,
-                'section': section_letter,
-                'start_para': para_idx,
-                'end_para': end_para,
-                'is_inline': is_inline,
-            })
+            # Check for inline section marker after a newline
+            # (handles cases like "Chapter 1: Sets\nA. Summary...")
+            if '\n' in txt:
+                lines = txt.split('\n')
+                for line in lines[1:]:  # skip first line
+                    line = line.strip()
+                    m = SECTION_RE.match(line)
+                    if m:
+                        letter = m.group(1)
+                        if is_real_section_marker(line, letter):
+                            boundaries.append((idx, letter))
+                            break  # only take the first inline match
 
-    return entries
-
-
-def get_actual_section_title(doc, entry):
-    """Extract the actual section title text from the document."""
-    para = doc.paragraphs[entry['start_para']]
-    txt = para.text.strip()
-    if entry['is_inline']:
-        parts = txt.split('\n', 1)
-        if len(parts) > 1:
-            return parts[1].strip()
-    else:
-        return txt
-    return None
+    return boundaries
 
 
-def create_section_file(doc, raw_bytes, entry, output_path):
+def group_into_units(boundaries):
     """
-    Create a new DOCX for a single section by cloning the source document
-    (preserving all styles, numbering, fonts, themes) and replacing the body.
+    Group section boundaries into unit-chunks.
+    Each chunk starts with Section A and contains all subsequent sections
+    until the next A (or end of document).
+
+    Returns list of lists: [[boundary1, boundary2, ...], ...]
+    Each boundary is (element_index, section_letter).
     """
-    # Clone the source document from raw bytes so all internal parts are preserved
+    units = []
+    current_unit = []
+
+    for boundary in boundaries:
+        letter = boundary[1]
+        if letter == 'A' and current_unit:
+            units.append(current_unit)
+            current_unit = []
+        current_unit.append(boundary)
+
+    if current_unit:
+        units.append(current_unit)
+
+    return units
+
+
+def create_section_file(raw_bytes, body, section_start_idx, section_end_idx, output_path):
+    """
+    Create a new DOCX for a single section by:
+    1. Cloning the source document (preserves styles, numbering, fonts, themes, images)
+    2. Replacing the body with only the elements for this section
+    """
+    # Clone from raw bytes
     new_doc = Document(io.BytesIO(raw_bytes))
+    new_body = new_doc.element.body
 
-    # Clear the body of the cloned document
-    body = new_doc.element.body
-    for child in list(body):
-        # Keep sectPr (page layout settings) but remove all paragraphs and tables
-        if child.tag != qn('w:sectPr'):
-            body.remove(child)
+    # Collect all source body children to copy
+    source_children = list(body)
 
-    source_paras = doc.paragraphs
+    # Identify elements to keep: from section_start_idx to section_end_idx (inclusive)
+    elements_to_keep = []
+    for i in range(section_start_idx, section_end_idx + 1):
+        if i < len(source_children):
+            elements_to_keep.append(copy.deepcopy(source_children[i]))
 
-    # --- 1. Build Unit header paragraph from the source Unit paragraph ---
-    # Find the source Unit header paragraph to clone its formatting
-    unit_para_idx = find_unit_para(doc, entry['unit'])
-    if unit_para_idx is not None:
-        # Clone the Unit paragraph from source
-        unit_elem = copy.deepcopy(source_paras[unit_para_idx]._element)
-        # Insert before sectPr
-        _insert_before_sectpr(body, unit_elem)
-    else:
-        # Fallback: create a simple bold paragraph
-        _insert_before_sectpr(body, _make_bold_para(entry['unit']))
-
-    # --- 2. Build Chapter + Section header paragraph ---
-    # Clone the original chapter paragraph and modify it to include the section title
-    chapter_para_idx = find_chapter_para(doc, entry)
-    sec_title = get_actual_section_title(doc, entry)
-
-    if chapter_para_idx is not None:
-        orig_chapter_elem = source_paras[chapter_para_idx]._element
-        # We need to build a new paragraph that has:
-        #   - The chapter title runs (from the original chapter paragraph)
-        #   - A line break
-        #   - The section title (bold)
-        # But we want to preserve the original paragraph's formatting properties
-
-        ch_elem = copy.deepcopy(orig_chapter_elem)
-
-        # If this is an inline section (Chapter + Section A in same para),
-        # the paragraph already has both. We keep it as-is.
-        if entry['is_inline']:
-            _insert_before_sectpr(body, ch_elem)
+    # Clear the cloned document's body (keep sectPr for page layout)
+    sectPr = None
+    for child in list(new_body):
+        if child.tag == W_SECT_PR:
+            sectPr = child
         else:
-            # Remove all runs and content from the cloned chapter paragraph,
-            # keeping only pPr (paragraph properties)
-            for child in list(ch_elem):
-                if child.tag != qn('w:pPr'):
-                    ch_elem.remove(child)
+            new_body.remove(child)
 
-            # Get the run formatting from the original chapter paragraph's first run
-            orig_rPr = _get_first_rPr(orig_chapter_elem)
-
-            # Add chapter title run
-            ch_run = _make_run(entry['chapter'], orig_rPr)
-            ch_elem.append(ch_run)
-
-            # Add line break
-            br_run = _make_br_run(orig_rPr)
-            ch_elem.append(br_run)
-
-            # Add section title run
-            sec_run = _make_run(sec_title or f"{entry['section']}.", orig_rPr)
-            ch_elem.append(sec_run)
-
-            _insert_before_sectpr(body, ch_elem)
-    else:
-        # Fallback
-        _insert_before_sectpr(body, _make_bold_para(f"{entry['chapter']}\n{sec_title}"))
-
-    # --- 3. Copy content paragraphs ---
-    start = entry['start_para']
-    end = entry['end_para']
-    content_start = start + 1  # Skip the section marker paragraph
-
-    for i in range(content_start, end + 1):
-        if i < len(source_paras):
-            elem = copy.deepcopy(source_paras[i]._element)
-            _insert_before_sectpr(body, elem)
+    # Insert our section elements
+    for elem in elements_to_keep:
+        if sectPr is not None:
+            sectPr.addprevious(elem)
+        else:
+            new_body.append(elem)
 
     new_doc.save(output_path)
 
 
-def find_unit_para(doc, unit_text):
-    """Find the paragraph index of a Unit header matching the given text."""
-    for i, p in enumerate(doc.paragraphs):
-        if p.text.strip() == unit_text:
-            return i
-    return None
+def process_file(input_path, output_folder):
+    """
+    Process a single DOCX file: find sections, group into units,
+    and create individual output files.
+    """
+    print(f"\n{'='*60}")
+    print(f"Processing: {input_path}")
+    print(f"{'='*60}")
 
+    # Read raw bytes for efficient cloning
+    with open(input_path, 'rb') as f:
+        raw_bytes = f.read()
 
-def find_chapter_para(doc, entry):
-    """Find the paragraph index of the Chapter header for this entry."""
-    start = entry['start_para']
-    # For inline sections, the chapter para IS the start_para
-    if entry['is_inline']:
-        return start
-    # Otherwise, search backwards from the section start to find the chapter para
-    for i in range(start - 1, max(start - 10, -1), -1):
-        txt = doc.paragraphs[i].text.strip()
-        if txt.startswith('Chapter'):
-            return i
-    return None
+    doc = Document(input_path)
+    body = doc.element.body
+    body_children = list(body)
+    total_elements = len(body_children)
 
+    print(f"  Total body elements: {total_elements}")
 
-def _get_first_rPr(para_elem):
-    """Extract the rPr (run properties) from the first run of a paragraph element."""
-    ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-    for run in para_elem.findall(f'{{{ns}}}r'):
-        rPr = run.find(f'{{{ns}}}rPr')
-        if rPr is not None:
-            return copy.deepcopy(rPr)
-    return None
+    # Find all section boundaries
+    boundaries = find_section_boundaries(body)
+    print(f"  Found {len(boundaries)} section markers")
 
+    if not boundaries:
+        print(f"  WARNING: No section markers found, skipping this file!")
+        return 0
 
-def _make_run(text, rPr=None):
-    """Create a w:r element with given text and optional rPr."""
-    run = OxmlElement('w:r')
-    if rPr is not None:
-        run.append(copy.deepcopy(rPr))
-    t = OxmlElement('w:t')
-    t.set(qn('xml:space'), 'preserve')
-    t.text = text
-    run.append(t)
-    return run
+    # Group into unit-chunks
+    units = group_into_units(boundaries)
+    print(f"  Found {len(units)} unit-chunks")
 
+    # Create output directory
+    os.makedirs(output_folder, exist_ok=True)
 
-def _make_br_run(rPr=None):
-    """Create a w:r element containing a line break."""
-    run = OxmlElement('w:r')
-    if rPr is not None:
-        run.append(copy.deepcopy(rPr))
-    br = OxmlElement('w:br')
-    run.append(br)
-    return run
+    created = 0
+    for unit_idx, unit_boundaries in enumerate(units):
+        unit_num = unit_idx + 1
 
+        for sec_idx, (elem_start, letter) in enumerate(unit_boundaries):
+            if letter in SECTIONS_TO_SKIP:
+                continue
 
-def _make_bold_para(text):
-    """Create a simple bold paragraph element (fallback)."""
-    p = OxmlElement('w:p')
-    r = OxmlElement('w:r')
-    rPr = OxmlElement('w:rPr')
-    b = OxmlElement('w:b')
-    rPr.append(b)
-    r.append(rPr)
-    t = OxmlElement('w:t')
-    t.set(qn('xml:space'), 'preserve')
-    t.text = text
-    r.append(t)
-    p.append(r)
-    return p
+            # Determine end of this section:
+            # - If there's a next section in this unit, end = next_start - 1
+            # - If this is the last section in this unit, check if there's a next unit
+            # - Otherwise, end = last body element (before sectPr)
+            if sec_idx + 1 < len(unit_boundaries):
+                elem_end = unit_boundaries[sec_idx + 1][0] - 1
+            elif unit_idx + 1 < len(units):
+                # Next unit's first section A
+                elem_end = units[unit_idx + 1][0][0] - 1
+            else:
+                # Last section of last unit - go to end of body
+                elem_end = total_elements - 1
+                # Skip sectPr at the end
+                while elem_end >= 0 and body_children[elem_end].tag == W_SECT_PR:
+                    elem_end -= 1
 
+            filename = f"Unit {unit_num} Sec {letter}.docx"
+            output_path = os.path.join(output_folder, filename)
 
-def _insert_before_sectpr(body, element):
-    """Insert an element before the sectPr in the body, or at the end."""
-    sectPr = body.find(qn('w:sectPr'))
-    if sectPr is not None:
-        sectPr.addprevious(element)
-    else:
-        body.append(element)
+            create_section_file(raw_bytes, body, elem_start, elem_end, output_path)
+            created += 1
 
-
-def get_unit_roman(unit_num):
-    return ROMAN_MAP.get(unit_num, str(unit_num))
+    print(f"  [OK] Created {created} files in '{output_folder}/'")
+    return created
 
 
 def main():
-    print(f"Loading input document: {INPUT_FILE}")
+    print("Universal DOCX Section Segregation")
+    print("===================================\n")
 
-    # Read raw bytes once for efficient cloning
-    with open(INPUT_FILE, 'rb') as f:
-        raw_bytes = f.read()
+    # Find all input files
+    input_files = []
+    for subject_dir in sorted(os.listdir(INPUT_DIR)):
+        subject_path = os.path.join(INPUT_DIR, subject_dir)
+        if os.path.isdir(subject_path):
+            for fname in os.listdir(subject_path):
+                if fname.lower().endswith('.docx') and not fname.startswith('~'):
+                    input_files.append((
+                        os.path.join(subject_path, fname),
+                        subject_dir
+                    ))
 
-    doc = Document(INPUT_FILE)
-    print(f"Total paragraphs: {len(doc.paragraphs)}")
+    print(f"Found {len(input_files)} input files:")
+    for fpath, subj in input_files:
+        print(f"  [{subj}] {os.path.basename(fpath)}")
 
-    print("\nParsing document structure...")
-    entries = parse_structure(doc)
-    print(f"Found {len(entries)} sections total")
+    total_created = 0
+    for input_path, subject_folder in input_files:
+        output_folder = os.path.join(OUTPUT_DIR, subject_folder)
+        count = process_file(input_path, output_folder)
+        total_created += count
 
-    entries = [e for e in entries if e['section'] not in SECTIONS_TO_SKIP]
-    print(f"After skipping Section E: {len(entries)} sections to extract")
-
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    created_files = []
-    for i, entry in enumerate(entries):
-        unit_roman = get_unit_roman(entry['unit_num'])
-        filename = f"Unit {unit_roman} Ch {entry['chapter_num']} Sec {entry['section']}.docx"
-        output_path = os.path.join(OUTPUT_DIR, filename)
-
-        print(f"  [{i+1}/{len(entries)}] Creating: {filename}")
-        create_section_file(doc, raw_bytes, entry, output_path)
-        created_files.append(filename)
-
-    print(f"\n✓ Created {len(created_files)} files in '{OUTPUT_DIR}/' directory")
-
-    # Summary
-    units = {}
-    for entry in entries:
-        u = get_unit_roman(entry['unit_num'])
-        if u not in units:
-            units[u] = set()
-        units[u].add(entry['chapter_num'])
-
-    print("\nSummary:")
-    for u in sorted(units.keys()):
-        chapters = sorted(units[u])
-        print(f"  Unit {u}: {len(chapters)} chapters (Ch {', '.join(map(str, chapters))})")
+    print(f"\n{'='*60}")
+    print(f"TOTAL: Created {total_created} files across {len(input_files)} subjects")
+    print(f"{'='*60}")
 
 
 if __name__ == '__main__':
